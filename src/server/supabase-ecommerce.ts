@@ -4,19 +4,6 @@ function getWriteClient() {
   return getServiceRoleSupabaseClient() || getServerSupabaseClient();
 }
 
-function asUuidOrNull(value?: string | null): string | null {
-  const clean = String(value || '').trim();
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean)
-    ? clean
-    : null;
-}
-
-function resolveCustomerCode(customerId?: string, userUid?: string): string {
-  if (customerId && customerId.trim()) return customerId.trim();
-  if (userUid && userUid.startsWith('NTF-CUST-')) return userUid;
-  return '';
-}
-
 export async function syncCategoryToSupabase(cat: {
   name: string;
   slug: string;
@@ -119,74 +106,43 @@ export async function syncProductToSupabase(prod: {
 
 export async function syncCustomerProfileToSupabase(user: {
   uid: string;
-  authUserId?: string | null;
-  customerId?: string;
-  customerCode?: string;
   email: string;
   fullName: string;
   mobile: string;
   companyOrCollege?: string;
-  fullAddress?: string;
-  city?: string;
-  state?: string;
-  pinCode?: string;
-  accountStatus?: string;
   role?: string;
   emailVerified?: boolean;
   phoneVerified?: boolean;
   emailConfirmedAt?: string;
   phoneConfirmedAt?: string;
-  notificationPreferences?: Record<string, boolean>;
-  passwordConfigured?: boolean;
 }) {
   const client = getWriteClient();
   if (user.role && user.role !== 'customer') return;
-  const profileUuid = asUuidOrNull(user.authUserId) || asUuidOrNull(user.uid);
-  if (!client || !profileUuid) {
+  if (!client || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(user.uid)) {
     return;
   }
-  const resolvedCode = user.customerCode || user.customerId || (user.uid.startsWith('NTF-CUST-') ? user.uid : '');
   try {
-    const payload: Record<string, unknown> = {
-      id: profileUuid,
-      email: user.email,
-      full_name: user.fullName || '',
-      phone: user.mobile || '',
-      company_or_college: user.companyOrCollege || '',
-      company_name: user.companyOrCollege || '',
-      role: user.role || 'customer',
-      email_verified: Boolean(user.emailVerified),
-      phone_verified: Boolean(user.phoneVerified),
-      email_confirmed_at: user.emailConfirmedAt || null,
-      phone_confirmed_at: user.phoneConfirmedAt || null,
-      updated_at: new Date().toISOString(),
-    };
-    if (resolvedCode) {
-      payload.customer_code = resolvedCode;
-      payload.customer_id = resolvedCode;
-    }
-    if (user.fullAddress !== undefined) payload.full_address = user.fullAddress;
-    if (user.city !== undefined) payload.city = user.city;
-    if (user.state !== undefined) payload.state = user.state;
-    if (user.pinCode !== undefined) payload.pin_code = user.pinCode;
-    if (user.accountStatus !== undefined) payload.account_status = user.accountStatus;
-    if (user.notificationPreferences !== undefined) {
-      payload.notification_preferences = user.notificationPreferences;
-    }
-    if (user.passwordConfigured !== undefined) {
-      payload.password_configured = Boolean(user.passwordConfigured);
-    }
-
-    const { error } = await client
-      .from('customer_profiles')
-      .upsert(payload, { onConflict: 'id' });
+    const { error } = await client.from('customer_profiles').upsert(
+      {
+        id: user.uid,
+        email: user.email,
+        full_name: user.fullName || '',
+        phone: user.mobile || '',
+        company_or_college: user.companyOrCollege || '',
+        role: user.role || 'customer',
+        email_verified: Boolean(user.emailVerified),
+        phone_verified: Boolean(user.phoneVerified),
+        email_confirmed_at: user.emailConfirmedAt || null,
+        phone_confirmed_at: user.phoneConfirmedAt || null,
+      },
+      { onConflict: 'id' }
+    );
     if (error && /column .* does not exist|schema cache/i.test(error.message || '')) {
       await client.from('customer_profiles').upsert(
         {
-          id: profileUuid,
+          id: user.uid,
           email: user.email,
           full_name: user.fullName || '',
-          phone: user.mobile || '',
           role: user.role || 'customer',
         },
         { onConflict: 'id' }
@@ -208,20 +164,15 @@ export async function syncCartToSupabase(
     variant?: string;
     color?: string;
   }>,
-  customerCode?: string,
-  authUserId?: string | null
+  customerCode?: string
 ) {
   const client = getWriteClient();
   if (!client || !userUid) return;
-  const resolvedAuthUid = asUuidOrNull(authUserId) || asUuidOrNull(userUid);
-  const resolvedCode = resolveCustomerCode(customerCode, userUid);
   try {
     const nowIso = new Date().toISOString();
     await client.from('customer_carts').upsert(
       {
         user_uid: userUid,
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        ...(resolvedCode ? { customer_id: resolvedCode } : {}),
         items,
         updated_at: nowIso,
       },
@@ -237,20 +188,17 @@ export async function syncCartToSupabase(
     if (cartRow?.id) {
       await client.from('customer_cart_items').delete().eq('cart_id', cartRow.id);
       if (items.length > 0) {
-        const qtyVal = (it: { qty?: number }) => Math.max(1, Number(it.qty || 1));
         await client.from('customer_cart_items').insert(
           items.map((it) => ({
             cart_id: cartRow.id,
             user_uid: userUid,
-            ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-            customer_id: resolvedCode,
+            customer_id: customerCode || (userUid.startsWith('NTF-CUST-') ? userUid : ''),
             product_id: Number(it.productId || 0),
             product_sku: String(it.sku || ''),
             product_name: String(it.name || ''),
             variant: String(it.variant || ''),
             color: String(it.color || ''),
-            quantity: qtyVal(it),
-            qty: qtyVal(it),
+            quantity: Math.max(1, Number(it.qty || 1)),
             unit_price_inr: Number(it.unitPriceInr || 0),
             updated_at: nowIso,
           }))
@@ -265,8 +213,6 @@ export async function syncCartToSupabase(
 export async function syncStoreOrderToSupabase(order: {
   orderNumber: string;
   userUid: string;
-  authUserId?: string | null;
-  customerId?: string;
   customerEmail?: string;
   billingAddress: unknown;
   shippingAddress: unknown;
@@ -291,83 +237,61 @@ export async function syncStoreOrderToSupabase(order: {
 }) {
   const client = getWriteClient();
   if (!client) return;
-  const resolvedAuthUid = asUuidOrNull(order.authUserId) || asUuidOrNull(order.userUid);
-  const resolvedCode = resolveCustomerCode(order.customerId, order.userUid);
   try {
-    const { data: orderRow } = await client
-      .from('store_orders')
-      .upsert(
-        {
-          order_number: order.orderNumber,
-          user_uid: order.userUid,
-          ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-          ...(resolvedCode ? { customer_id: resolvedCode } : {}),
-          customer_email: order.customerEmail || '',
-          billing_address: order.billingAddress || {},
-          shipping_address: order.shippingAddress || {},
-          items: order.items || [],
-          subtotal_inr: order.subtotalInr,
-          discount_inr: order.discountInr,
-          shipping_inr: order.shippingInr,
-          gst_inr: order.gstInr,
-          total_inr: order.totalInr,
-          coupon_code: order.couponCode || '',
-          payment_status: order.paymentStatus,
-          refund_status: order.refundStatus || 'none',
-          order_status: order.orderStatus,
-          razorpay_order_id: order.razorpayOrderId || '',
-          razorpay_payment_id: order.razorpayPaymentId || '',
-          tracking_courier: order.trackingCourier || '',
-          tracking_id: order.trackingId || '',
-          tracking_url: order.trackingUrl || '',
-          dispatch_date: order.dispatchDate || '',
-          expected_delivery_date: order.expectedDeliveryDate || '',
-          status_history: order.statusHistory || [],
-        },
-        { onConflict: 'order_number' }
-      )
-      .select('id')
-      .maybeSingle();
+    await client.from('store_orders').upsert(
+      {
+        order_number: order.orderNumber,
+        user_uid: order.userUid,
+        customer_email: order.customerEmail || '',
+        billing_address: order.billingAddress || {},
+        shipping_address: order.shippingAddress || {},
+        items: order.items || [],
+        subtotal_inr: order.subtotalInr,
+        discount_inr: order.discountInr,
+        shipping_inr: order.shippingInr,
+        gst_inr: order.gstInr,
+        total_inr: order.totalInr,
+        coupon_code: order.couponCode || '',
+        payment_status: order.paymentStatus,
+        refund_status: order.refundStatus || 'none',
+        order_status: order.orderStatus,
+        razorpay_order_id: order.razorpayOrderId || '',
+        razorpay_payment_id: order.razorpayPaymentId || '',
+        tracking_courier: order.trackingCourier || '',
+        tracking_id: order.trackingId || '',
+        tracking_url: order.trackingUrl || '',
+      },
+      { onConflict: 'order_number' }
+    );
 
     const itemsArr = Array.isArray(order.items) ? (order.items as Array<Record<string, any>>) : [];
     if (itemsArr.length > 0) {
       await client.from('order_items').delete().eq('order_number', order.orderNumber);
       await client.from('order_items').insert(
-        itemsArr.map((it) => {
-          const qtyVal = Math.max(1, Number(it.qty || 1));
-          return {
-            ...(orderRow?.id ? { order_id: orderRow.id } : {}),
-            order_number: order.orderNumber,
-            user_uid: order.userUid,
-            ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-            customer_id: resolvedCode,
-            product_id: Number(it.productId || 0),
-            product_sku: String(it.sku || ''),
-            hsn_code: String(it.hsnCode || ''),
-            product_name: String(it.name || ''),
-            image_url: String(it.imageUrl || ''),
-            variant: String(it.variant || ''),
-            color: String(it.color || ''),
-            quantity: qtyVal,
-            qty: qtyVal,
-            unit_price_inr: Number(it.unitPriceInr || 0),
-            gst_percent: Number(it.gstPercent ?? 18),
-            line_total_inr: Number(it.lineTotalInr || 0),
-          };
-        })
+        itemsArr.map((it) => ({
+          order_number: order.orderNumber,
+          user_uid: order.userUid,
+          product_id: Number(it.productId || 0),
+          product_sku: String(it.sku || ''),
+          hsn_code: String(it.hsnCode || ''),
+          product_name: String(it.name || ''),
+          image_url: String(it.imageUrl || ''),
+          variant: String(it.variant || ''),
+          color: String(it.color || ''),
+          quantity: Math.max(1, Number(it.qty || 1)),
+          unit_price_inr: Number(it.unitPriceInr || 0),
+          gst_percent: Number(it.gstPercent ?? 18),
+          line_total_inr: Number(it.lineTotalInr || 0),
+        }))
       );
     }
 
     await client.from('order_tracking').upsert(
       {
-        ...(orderRow?.id ? { order_id: orderRow.id } : {}),
         order_number: order.orderNumber,
         user_uid: order.userUid,
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        customer_id: resolvedCode,
         current_status: order.orderStatus,
         tracking_courier: order.trackingCourier || '',
-        courier_name: order.trackingCourier || '',
         tracking_number: order.trackingId || '',
         tracking_url: order.trackingUrl || '',
         dispatch_date: order.dispatchDate || '',
@@ -385,8 +309,6 @@ export async function syncStoreOrderToSupabase(order: {
 export async function syncPaymentToSupabase(payment: {
   paymentRef: string;
   userUid?: string;
-  authUserId?: string | null;
-  customerId?: string;
   entityType: string;
   entityRef?: string;
   razorpayOrderId?: string;
@@ -403,15 +325,11 @@ export async function syncPaymentToSupabase(payment: {
 }) {
   const client = getWriteClient();
   if (!client) return;
-  const resolvedAuthUid = asUuidOrNull(payment.authUserId) || asUuidOrNull(payment.userUid);
-  const resolvedCode = resolveCustomerCode(payment.customerId, payment.userUid);
   try {
     await client.from('razorpay_payments').upsert(
       {
         payment_ref: payment.paymentRef,
         user_uid: payment.userUid || '',
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        ...(resolvedCode ? { customer_id: resolvedCode } : {}),
         entity_type: payment.entityType,
         entity_ref: payment.entityRef || '',
         razorpay_order_id: payment.razorpayOrderId || '',
@@ -550,8 +468,6 @@ export async function syncProductEnquiryToSupabase(enquiry: {
 
 export async function syncPrintingOrderToSupabase(order: {
   orderNumber: string;
-  userUid?: string;
-  authUserId?: string | null;
   customerId?: string;
   customerName?: string;
   email?: string;
@@ -576,15 +492,10 @@ export async function syncPrintingOrderToSupabase(order: {
 }) {
   const client = getWriteClient();
   if (!client) return;
-  const resolvedUid = order.userUid || order.customerId || '';
-  const resolvedAuthUid = asUuidOrNull(order.authUserId) || asUuidOrNull(order.userUid);
-  const resolvedCode = resolveCustomerCode(order.customerId, order.userUid);
   try {
     const payload = {
       order_number: order.orderNumber,
-      user_uid: resolvedUid,
-      ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-      customer_id: resolvedCode || order.customerId || '',
+      customer_id: order.customerId || '',
       customer_name: order.customerName || '',
       email: order.email || '',
       phone: order.phone || '',
@@ -638,9 +549,8 @@ export async function syncPrintingOrderToSupabase(order: {
     await client.from('printing_3d_files').upsert(
       {
         order_number: order.orderNumber,
-        user_uid: resolvedUid,
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        customer_id: resolvedCode || order.customerId || '',
+        user_uid: order.customerId || '',
+        customer_id: order.customerId || '',
         file_name: order.fileName,
         file_format: order.fileFormat,
         file_size_bytes: order.fileSizeBytes,
@@ -669,7 +579,6 @@ export async function deletePrintingOrderFromSupabase(orderNumber: string) {
 export async function syncCustomerAddressToSupabase(address: {
   sourceAddressId: number;
   userUid: string;
-  authUserId?: string | null;
   customerId?: string;
   label?: string;
   addressType?: string;
@@ -687,8 +596,6 @@ export async function syncCustomerAddressToSupabase(address: {
 }) {
   const client = getWriteClient();
   if (!client || !address.userUid) return;
-  const resolvedAuthUid = asUuidOrNull(address.authUserId) || asUuidOrNull(address.userUid);
-  const resolvedCode = resolveCustomerCode(address.customerId, address.userUid);
   try {
     if (address.isDefault) {
       await client
@@ -699,24 +606,19 @@ export async function syncCustomerAddressToSupabase(address: {
     await client.from('customer_addresses').upsert(
       {
         source_address_id: address.sourceAddressId,
-        local_address_id: address.sourceAddressId,
         user_uid: address.userUid,
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        customer_id: resolvedCode,
+        customer_id: address.customerId || '',
         label: address.label || 'Delivery',
         address_type: address.addressType || 'both',
         full_name: address.fullName,
         mobile: address.mobile,
-        phone: address.mobile,
         house_flat: address.houseFlat,
         street_area: address.streetArea,
-        address_line: [address.houseFlat, address.streetArea].filter(Boolean).join(', '),
         landmark: address.landmark || '',
         city: address.city,
         district: address.district || '',
         state: address.state,
         pin_code: address.pinCode,
-        pincode: address.pinCode,
         country: address.country || 'India',
         is_default: Boolean(address.isDefault),
         updated_at: new Date().toISOString(),
@@ -740,27 +642,19 @@ export async function deleteCustomerAddressFromSupabase(sourceAddressId: number)
 
 export async function syncWishlistToSupabase(opts: {
   userUid: string;
-  authUserId?: string | null;
-  customerId?: string;
   productId: number;
   productSlug?: string;
-  productSku?: string;
   wishlisted: boolean;
 }) {
   const client = getWriteClient();
   if (!client || !opts.userUid) return;
-  const resolvedAuthUid = asUuidOrNull(opts.authUserId) || asUuidOrNull(opts.userUid);
-  const resolvedCode = resolveCustomerCode(opts.customerId, opts.userUid);
   try {
     if (opts.wishlisted) {
       await client.from('wishlists').upsert(
         {
           user_uid: opts.userUid,
-          ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-          customer_id: resolvedCode,
           product_id: opts.productId,
           product_slug: opts.productSlug || '',
-          product_sku: opts.productSku || '',
         },
         { onConflict: 'user_uid,product_id' }
       );
@@ -778,30 +672,20 @@ export async function syncWishlistToSupabase(opts: {
 
 export async function syncProductReviewToSupabase(review: {
   productId: number;
-  productSku?: string;
   userUid: string;
-  authUserId?: string | null;
-  customerId?: string;
   authorName: string;
   rating: number;
-  title?: string;
   comment: string;
   verifiedPurchase?: boolean;
 }) {
   const client = getWriteClient();
   if (!client || !review.userUid) return;
-  const resolvedAuthUid = asUuidOrNull(review.authUserId) || asUuidOrNull(review.userUid);
-  const resolvedCode = resolveCustomerCode(review.customerId, review.userUid);
   try {
     await client.from('product_reviews').insert({
       product_id: review.productId,
-      product_sku: review.productSku || '',
       user_uid: review.userUid,
-      ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-      customer_id: resolvedCode,
       author_name: review.authorName,
       rating: review.rating,
-      title: review.title || '',
       comment: review.comment,
       verified_purchase: review.verifiedPurchase ?? true,
     });
@@ -813,9 +697,6 @@ export async function syncProductReviewToSupabase(review: {
 export async function syncInvoiceToSupabase(inv: {
   invoiceNumber: string;
   userUid: string;
-  authUserId?: string | null;
-  customerId?: string;
-  orderNumber?: string;
   entityType: string;
   entityId: number;
   docType: string;
@@ -825,16 +706,11 @@ export async function syncInvoiceToSupabase(inv: {
 }) {
   const client = getWriteClient();
   if (!client || !inv.invoiceNumber) return;
-  const resolvedAuthUid = asUuidOrNull(inv.authUserId) || asUuidOrNull(inv.userUid);
-  const resolvedCode = resolveCustomerCode(inv.customerId, inv.userUid);
   try {
     await client.from('invoices').upsert(
       {
         invoice_number: inv.invoiceNumber,
         user_uid: inv.userUid,
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        customer_id: resolvedCode,
-        order_number: inv.orderNumber || String((inv.payload as any)?.orderNumber || ''),
         entity_type: inv.entityType,
         entity_id: inv.entityId,
         doc_type: inv.docType,
@@ -851,28 +727,18 @@ export async function syncInvoiceToSupabase(inv: {
 
 export async function syncNotificationToSupabase(notif: {
   userUid: string;
-  authUserId?: string | null;
-  customerId?: string;
   title: string;
   message: string;
-  category?: string;
-  type?: string;
   link?: string;
   isRead?: boolean;
 }) {
   const client = getWriteClient();
   if (!client || !notif.userUid) return;
-  const resolvedAuthUid = asUuidOrNull(notif.authUserId) || asUuidOrNull(notif.userUid);
-  const resolvedCode = resolveCustomerCode(notif.customerId, notif.userUid);
   try {
     await client.from('notifications').insert({
       user_uid: notif.userUid,
-      ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-      customer_id: resolvedCode,
       title: notif.title,
       message: notif.message,
-      category: notif.category || 'system',
-      type: notif.type || 'info',
       link: notif.link || '/my-account',
       is_read: Boolean(notif.isRead),
     });
@@ -884,7 +750,6 @@ export async function syncNotificationToSupabase(notif: {
 export async function syncPcbEnquiryToSupabase(pcb: {
   enquiryNumber: string;
   userUid: string;
-  authUserId?: string | null;
   customerId?: string;
   customerName: string;
   email: string;
@@ -902,50 +767,39 @@ export async function syncPcbEnquiryToSupabase(pcb: {
 }) {
   const client = getWriteClient();
   if (!client || !pcb.enquiryNumber) return;
-  const resolvedAuthUid = asUuidOrNull(pcb.authUserId) || asUuidOrNull(pcb.userUid);
-  const resolvedCode = resolveCustomerCode(pcb.customerId, pcb.userUid);
   try {
-    const { data: pcbRow } = await client
-      .from('pcb_enquiries')
-      .upsert(
-        {
-          enquiry_number: pcb.enquiryNumber,
-          user_uid: pcb.userUid,
-          ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-          customer_id: resolvedCode,
-          customer_name: pcb.customerName,
-          email: pcb.email,
-          mobile: pcb.mobile,
-          board_dimensions_mm: pcb.boardDimensionsMm,
-          layer_count: pcb.layerCount,
-          board_quantity: pcb.boardQuantity,
-          assembly_required: pcb.assemblyRequired,
-          surface_finish: pcb.surfaceFinish || 'HASL Lead-Free',
-          special_instructions: pcb.specialInstructions || '',
-          attachments: pcb.attachments || [],
-          quoted_amount_inr: pcb.quotedAmountInr ?? null,
-          payment_status: pcb.paymentStatus || 'pending',
-          status: pcb.status,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'enquiry_number' }
-      )
-      .select('id')
-      .maybeSingle();
+    await client.from('pcb_enquiries').upsert(
+      {
+        enquiry_number: pcb.enquiryNumber,
+        user_uid: pcb.userUid,
+        customer_id: pcb.customerId || '',
+        customer_name: pcb.customerName,
+        email: pcb.email,
+        mobile: pcb.mobile,
+        board_dimensions_mm: pcb.boardDimensionsMm,
+        layer_count: pcb.layerCount,
+        board_quantity: pcb.boardQuantity,
+        assembly_required: pcb.assemblyRequired,
+        surface_finish: pcb.surfaceFinish || 'HASL Lead-Free',
+        special_instructions: pcb.specialInstructions || '',
+        attachments: pcb.attachments || [],
+        quoted_amount_inr: pcb.quotedAmountInr ?? null,
+        payment_status: pcb.paymentStatus || 'pending',
+        status: pcb.status,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'enquiry_number' }
+    );
 
     if (pcb.attachments && pcb.attachments.length > 0) {
       await client.from('pcb_files').delete().eq('enquiry_number', pcb.enquiryNumber);
       await client.from('pcb_files').insert(
         pcb.attachments.map((att) => ({
-          ...(pcbRow?.id ? { enquiry_id: pcbRow.id } : {}),
           enquiry_number: pcb.enquiryNumber,
           user_uid: pcb.userUid,
-          ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-          customer_id: resolvedCode,
           file_name: att.originalName,
           file_kind: /\.csv$|\.xlsx$/i.test(att.originalName) ? 'bom' : 'gerber',
           file_size_bytes: att.sizeBytes,
-          size_bytes: att.sizeBytes,
           storage_path: att.storagePath,
         }))
       );
@@ -958,7 +812,6 @@ export async function syncPcbEnquiryToSupabase(pcb: {
 export async function syncB2bEnquiryToSupabase(b2b: {
   enquiryNumber: string;
   userUid: string;
-  authUserId?: string | null;
   customerId?: string;
   companyName: string;
   contactPerson: string;
@@ -977,15 +830,12 @@ export async function syncB2bEnquiryToSupabase(b2b: {
 }) {
   const client = getWriteClient();
   if (!client || !b2b.enquiryNumber) return;
-  const resolvedAuthUid = asUuidOrNull(b2b.authUserId) || asUuidOrNull(b2b.userUid);
-  const resolvedCode = resolveCustomerCode(b2b.customerId, b2b.userUid);
   try {
     await client.from('b2b_enquiries').upsert(
       {
         enquiry_number: b2b.enquiryNumber,
         user_uid: b2b.userUid,
-        ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-        customer_id: resolvedCode,
+        customer_id: b2b.customerId || '',
         company_name: b2b.companyName,
         contact_person: b2b.contactPerson,
         email: b2b.email,
@@ -1012,7 +862,6 @@ export async function syncB2bEnquiryToSupabase(b2b: {
 export async function syncSupportTicketToSupabase(ticket: {
   ticketNumber: string;
   userUid: string;
-  authUserId?: string | null;
   customerId?: string;
   subject: string;
   serviceCategory: string;
@@ -1021,41 +870,30 @@ export async function syncSupportTicketToSupabase(ticket: {
 }) {
   const client = getWriteClient();
   if (!client || !ticket.ticketNumber) return;
-  const resolvedAuthUid = asUuidOrNull(ticket.authUserId) || asUuidOrNull(ticket.userUid);
-  const resolvedCode = resolveCustomerCode(ticket.customerId, ticket.userUid);
   try {
-    const { data: ticketRow } = await client
-      .from('support_tickets')
-      .upsert(
-        {
-          ticket_number: ticket.ticketNumber,
-          user_uid: ticket.userUid,
-          ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-          customer_id: resolvedCode,
-          subject: ticket.subject,
-          service_category: ticket.serviceCategory,
-          status: ticket.status,
-          messages: ticket.messages || [],
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'ticket_number' }
-      )
-      .select('id')
-      .maybeSingle();
+    await client.from('support_tickets').upsert(
+      {
+        ticket_number: ticket.ticketNumber,
+        user_uid: ticket.userUid,
+        customer_id: ticket.customerId || '',
+        subject: ticket.subject,
+        service_category: ticket.serviceCategory,
+        status: ticket.status,
+        messages: ticket.messages || [],
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'ticket_number' }
+    );
 
     if (ticket.messages && ticket.messages.length > 0) {
       await client.from('support_messages').delete().eq('ticket_number', ticket.ticketNumber);
       await client.from('support_messages').insert(
         ticket.messages.map((m) => ({
-          ...(ticketRow?.id ? { ticket_id: ticketRow.id } : {}),
           ticket_number: ticket.ticketNumber,
           user_uid: ticket.userUid,
-          ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-          customer_id: resolvedCode,
           sender_name: m.sender,
           sender_role: m.role,
           message_text: m.text,
-          message: m.text,
           created_at: m.timestamp || new Date().toISOString(),
         }))
       );
@@ -1067,9 +905,7 @@ export async function syncSupportTicketToSupabase(ticket: {
 
 export async function syncActivityLogToSupabase(entry: {
   userUid: string;
-  authUserId?: string | null;
   customerId?: string;
-  email?: string;
   action: string;
   entityType?: string;
   entityId?: string;
@@ -1077,20 +913,14 @@ export async function syncActivityLogToSupabase(entry: {
 }) {
   const client = getWriteClient();
   if (!client || !entry.userUid) return;
-  const resolvedAuthUid = asUuidOrNull(entry.authUserId) || asUuidOrNull(entry.userUid);
-  const resolvedCode = resolveCustomerCode(entry.customerId, entry.userUid);
   try {
     await client.from('customer_activity_logs').insert({
       user_uid: entry.userUid,
-      ...(resolvedAuthUid ? { auth_user_id: resolvedAuthUid } : {}),
-      customer_id: resolvedCode,
-      email: entry.email || '',
+      customer_id: entry.customerId || '',
       action: entry.action,
-      category: entry.entityType || 'account',
       entity_type: entry.entityType || '',
       entity_id: entry.entityId || '',
       details: entry.details || {},
-      metadata: entry.details || {},
     });
   } catch {
     // Non-blocking sync
